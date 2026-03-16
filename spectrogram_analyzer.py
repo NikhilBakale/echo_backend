@@ -4,6 +4,7 @@ from scipy import ndimage, signal
 from scipy.interpolate import interp1d
 from typing import Dict, List, Tuple, Optional
 import librosa
+import soundfile as sf
 from pathlib import Path
 from dataclasses import dataclass
 
@@ -51,8 +52,15 @@ class SpectrogramParameterExtractor:
     
     def extract_parameters(self, audio_path: Path) -> EnhancedCallParameters:
         """Main extraction pipeline"""
-        # Load audio and generate spectrogram
-        y, sr = librosa.load(audio_path, sr=None)
+        # Load WAV with soundfile first to avoid optional audioread/pkg_resources path.
+        try:
+            y, sr = sf.read(str(audio_path), always_2d=False)
+            if isinstance(y, np.ndarray) and y.ndim > 1:
+                y = np.mean(y, axis=1)
+            y = y.astype(np.float32, copy=False)
+        except Exception:
+            # Fallback keeps backward compatibility for edge file formats.
+            y, sr = librosa.load(audio_path, sr=None)
         
         # Generate high-resolution spectrogram
         n_fft = 2048
