@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+env/
+ENV/
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs and runtime
+*.log
+*.out
+*.err
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+credentials.json
+credentials.txt
+client_secrets.json
+client_secrets_template.json
+*.pem
+*.key
+*.p12
+
+# Cloud provider and deployment artifacts to ignore
+.azure/
+.deployment
+.deployment.config
+azure-*.yml
+web.config
+oryx-manifest.toml
+
+# Docker local files
+.docker/
+
+# Tests
+.pytest_cache/
+.coverage
+htmlcov/

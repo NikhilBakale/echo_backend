@@ -1,0 +1,41 @@
+# Git and local tooling
+.git
+.github
+.vscode
+.idea
+
+# Python caches and envs
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.venv
+venv
+ENV
+env
+
+# Build and test artifacts
+build
+dist
+*.egg-info
+.pytest_cache
+.coverage
+htmlcov
+
+# Local runtime artifacts
+*.log
+backend.err
+backend.log
+static/spectrograms/*
+static/audio/*
+!static/spectrograms/.gitkeep
+!static/audio/.gitkeep
+
+# Secrets and local overrides
+.env
+.env.local
+credentials.json
+credentials.txt
+client_secrets.json
+*.pem
+*.key
