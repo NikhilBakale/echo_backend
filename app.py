@@ -92,6 +92,21 @@ def format_bytes(size_bytes):
     s = round(size_bytes / p, 2)
     return f"{s} {size_names[i]}"
 
+
+def load_audio_for_analysis(audio_path):
+    """Load WAV audio without depending on librosa.load/pkg_resources."""
+    import soundfile as sf
+
+    try:
+        y, sr = sf.read(str(audio_path), always_2d=False)
+        if isinstance(y, np.ndarray) and y.ndim > 1:
+            y = np.mean(y, axis=1)
+        return y.astype(np.float32, copy=False), sr
+    except Exception as sf_err:
+        logger.warning(f"soundfile load failed, falling back to librosa.load: {sf_err}")
+        import librosa
+        return librosa.load(audio_path, sr=None)
+
 @app.route('/api/stream/audio/<file_id>')
 def stream_audio(file_id):
     """Stream audio file directly from Google Drive"""
@@ -1232,7 +1247,7 @@ def predict_single_audio():
         import librosa
         import librosa.display
 
-        y, sr = librosa.load(audio_path, sr=None)
+        y, sr = load_audio_for_analysis(audio_path)
 
         # Extract GUANO metadata
         metadata = {}
@@ -1409,7 +1424,7 @@ def batch_process_folder():
                 import matplotlib.pyplot as plt
                 import numpy as np
                 
-                y, sr = librosa.load(audio_path, sr=None)
+                y, sr = load_audio_for_analysis(audio_path)
                 D = librosa.stft(y, n_fft=2048, hop_length=256)
                 S_db = librosa.amplitude_to_db(np.abs(D), ref=np.max)
                 
@@ -1951,7 +1966,7 @@ def predict_standalone_single_audio():
         import librosa
         import librosa.display
 
-        y, sr = librosa.load(audio_path, sr=None)
+        y, sr = load_audio_for_analysis(audio_path)
 
         # Extract metadata and call parameters
         metadata = {}
@@ -2104,7 +2119,7 @@ def repredict_audio():
         import librosa
         import librosa.display
 
-        y, sr = librosa.load(audio_path, sr=None)
+        y, sr = load_audio_for_analysis(audio_path)
         D = librosa.stft(y, n_fft=2048, hop_length=256)
         S_db = librosa.amplitude_to_db(np.abs(D), ref=np.max)
 
@@ -2239,7 +2254,7 @@ def repredict_standalone_audio():
         import librosa
         import librosa.display
 
-        y, sr = librosa.load(audio_path, sr=None)
+        y, sr = load_audio_for_analysis(audio_path)
         D = librosa.stft(y, n_fft=2048, hop_length=256)
         S_db = librosa.amplitude_to_db(np.abs(D), ref=np.max)
 
