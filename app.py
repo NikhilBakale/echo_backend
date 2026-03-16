@@ -56,13 +56,18 @@ except Exception as e:
     traceback.print_exc()
 
 app = Flask(__name__)
-CORS(app,
-    origins=["*"],
+CORS(
+    app,
+    resources={
+        r"/api/*": {
+            "origins": ["https://echo-frontend-tau.vercel.app"]
+        }
+    },
     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
     expose_headers=["Content-Disposition"],
-    supports_credentials=False
-) # Enable CORS for React frontend
+    supports_credentials=False,
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
