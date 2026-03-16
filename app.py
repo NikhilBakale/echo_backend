@@ -165,6 +165,57 @@ def get_basic_call_parameters(audio_path: Path) -> dict:
         logger.warning(f"Fallback call-parameter extraction failed: {e}")
         return {}
 
+
+def compute_stft_db(y: np.ndarray, sr: int, n_fft: int = 2048, hop_length: int = 256):
+    """Compute STFT power in dB without librosa."""
+    from scipy import signal as scipy_signal
+
+    noverlap = max(0, n_fft - hop_length)
+    freqs, times, zxx = scipy_signal.stft(
+        y,
+        fs=sr,
+        nperseg=n_fft,
+        noverlap=noverlap,
+        boundary=None,
+        padded=False,
+    )
+    s_db = 20 * np.log10(np.maximum(np.abs(zxx), 1e-10))
+    return freqs, times, s_db
+
+
+def save_spectrogram_png(
+    s_db: np.ndarray,
+    freqs: np.ndarray,
+    times: np.ndarray,
+    output_path: str,
+    title: str,
+):
+    """Save spectrogram image without librosa.display."""
+    t_min = float(times[0]) if times.size else 0.0
+    t_max = float(times[-1]) if times.size else float(max(s_db.shape[1] - 1, 1))
+    f_min = float(freqs[0]) if freqs.size else 0.0
+    f_max = float(freqs[-1]) if freqs.size else 1.0
+
+    plt.figure(figsize=(12, 6))
+    plt.imshow(
+        s_db,
+        origin='lower',
+        aspect='auto',
+        extent=[t_min, t_max, f_min, f_max],
+        cmap='viridis',
+    )
+    plt.colorbar(format='%+2.0f dB')
+    plt.ylim(10000, min(200000, f_max))
+    if f_max >= 10000:
+        plt.yticks(np.arange(10000, min(200000, int(f_max)) + 1, 20000))
+    plt.title(title, color='white', fontsize=14)
+    plt.xlabel('Time (s)', color='white')
+    plt.ylabel('Frequency (Hz)', color='white')
+    plt.tick_params(colors='white')
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='black')
+    plt.close()
+
 @app.route('/api/stream/audio/<file_id>')
 def stream_audio(file_id):
     """Stream audio file directly from Google Drive"""
@@ -1302,9 +1353,6 @@ def predict_single_audio():
             drive_service.drive.CreateFile({'id': file_id}).GetContentFile(tmp.name)
             audio_path = tmp.name
 
-        import librosa
-        import librosa.display
-
         y, sr = load_audio_for_analysis(audio_path)
 
         # Extract GUANO metadata
@@ -1341,24 +1389,12 @@ def predict_single_audio():
 
         if not existing_spec or spec_drive_id is None:
             # Generate spectrogram from WAV and upload to Drive
-            D = librosa.stft(y, n_fft=2048, hop_length=256)
-            S_db = librosa.amplitude_to_db(np.abs(D), ref=np.max)
+            freqs, times, S_db = compute_stft_db(y, sr, n_fft=2048, hop_length=256)
 
             with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_spec:
                 tmp_spec_path = tmp_spec.name
 
-            plt.figure(figsize=(12, 6))
-            librosa.display.specshow(S_db, sr=sr, hop_length=256, x_axis='time', y_axis='hz', cmap='viridis')
-            plt.colorbar(format='%+2.0f dB')
-            plt.ylim(10000, 200000)
-            plt.yticks(np.arange(10000, 200001, 20000))
-            plt.title(file_name, color='white', fontsize=14)
-            plt.xlabel('Time (s)', color='white')
-            plt.ylabel('Frequency (Hz)', color='white')
-            plt.tick_params(colors='white')
-            plt.tight_layout()
-            plt.savefig(tmp_spec_path, dpi=150, bbox_inches='tight', facecolor='black')
-            plt.close()
+            save_spectrogram_png(S_db, freqs, times, tmp_spec_path, file_name)
 
             if folder_id:
                 try:
@@ -1476,28 +1512,14 @@ def batch_process_folder():
                 from guano_metadata_extractor import extract_metadata_from_file
                 metadata = extract_metadata_from_file(audio_path)
                 
-                # Generate spectrogram using WildSynapse method
-                import librosa
-                import librosa.display
-                import matplotlib.pyplot as plt
-                import numpy as np
-                
+                # Generate spectrogram
                 y, sr = load_audio_for_analysis(audio_path)
-                D = librosa.stft(y, n_fft=2048, hop_length=256)
-                S_db = librosa.amplitude_to_db(np.abs(D), ref=np.max)
+                freqs, times, S_db = compute_stft_db(y, sr, n_fft=2048, hop_length=256)
                 
                 # Save spectrogram
                 with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_spec:
-                    plt.figure(figsize=(10, 6))
-                    librosa.display.specshow(S_db, sr=sr, hop_length=256, x_axis='time', y_axis='hz', cmap='viridis')
-                    plt.colorbar(format='%+2.0f dB')
-                    plt.ylim(10000, 200000)  # Set frequency range from 10 kHz to 200 kHz
-                    plt.yticks(np.arange(10000, 200001, 20000))  # Set y-axis ticks every 20 kHz
-                    plt.title(audio_file['name'])
-                    plt.tight_layout()
-                    plt.savefig(tmp_spec.name, dpi=150, bbox_inches='tight', facecolor='black')
-                    plt.close()
                     spectrogram_path = tmp_spec.name
+                save_spectrogram_png(S_db, freqs, times, spectrogram_path, audio_file['name'])
                 
                 # Run ML prediction
                 if ML_MODEL_AVAILABLE:
@@ -2022,9 +2044,6 @@ def predict_standalone_single_audio():
         except Exception as e:
             logger.warning(f"Could not get audio info: {e}")
 
-        import librosa
-        import librosa.display
-
         y, sr = load_audio_for_analysis(audio_path)
 
         # Extract metadata and call parameters
@@ -2061,25 +2080,13 @@ def predict_standalone_single_audio():
 
         if not existing_spec or spec_drive_id is None:
             # Generate spectrogram from WAV and upload to Drive
-            D = librosa.stft(y, n_fft=2048, hop_length=256)
-            S_db = librosa.amplitude_to_db(np.abs(D), ref=np.max)
+            freqs, times, S_db = compute_stft_db(y, sr, n_fft=2048, hop_length=256)
 
             with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_spec:
                 tmp_spec_path = tmp_spec.name
 
             try:
-                plt.figure(figsize=(12, 6))
-                librosa.display.specshow(S_db, sr=sr, hop_length=256, x_axis='time', y_axis='hz', cmap='viridis')
-                plt.colorbar(format='%+2.0f dB')
-                plt.ylim(10000, 200000)
-                plt.yticks(np.arange(10000, 200001, 20000))
-                plt.title(file_name, color='white', fontsize=14)
-                plt.xlabel('Time (s)', color='white')
-                plt.ylabel('Frequency (Hz)', color='white')
-                plt.tick_params(colors='white')
-                plt.tight_layout()
-                plt.savefig(tmp_spec_path, dpi=150, bbox_inches='tight', facecolor='black')
-                plt.close()
+                save_spectrogram_png(S_db, freqs, times, tmp_spec_path, file_name)
                 logger.info(f"Generated spectrogram: {tmp_spec_path}")
             except Exception as e:
                 logger.error(f"Failed to generate spectrogram: {e}")
@@ -2176,12 +2183,8 @@ def repredict_audio():
             drive_service.drive.CreateFile({'id': file_id}).GetContentFile(tmp.name)
             audio_path = tmp.name
 
-        import librosa
-        import librosa.display
-
         y, sr = load_audio_for_analysis(audio_path)
-        D = librosa.stft(y, n_fft=2048, hop_length=256)
-        S_db = librosa.amplitude_to_db(np.abs(D), ref=np.max)
+        freqs, times, S_db = compute_stft_db(y, sr, n_fft=2048, hop_length=256)
 
         metadata = {}
         try:
@@ -2200,18 +2203,7 @@ def repredict_audio():
         with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_spec:
             tmp_spec_path = tmp_spec.name
 
-        plt.figure(figsize=(12, 6))
-        librosa.display.specshow(S_db, sr=sr, hop_length=256, x_axis='time', y_axis='hz', cmap='viridis')
-        plt.colorbar(format='%+2.0f dB')
-        plt.ylim(10000, 200000)
-        plt.yticks(np.arange(10000, 200001, 20000))
-        plt.title(file_name, color='white', fontsize=14)
-        plt.xlabel('Time (s)', color='white')
-        plt.ylabel('Frequency (Hz)', color='white')
-        plt.tick_params(colors='white')
-        plt.tight_layout()
-        plt.savefig(tmp_spec_path, dpi=150, bbox_inches='tight', facecolor='black')
-        plt.close()
+        save_spectrogram_png(S_db, freqs, times, tmp_spec_path, file_name)
 
         species_list = []
         if ML_MODEL_AVAILABLE:
@@ -2311,12 +2303,8 @@ def repredict_standalone_audio():
         except Exception:
             pass
 
-        import librosa
-        import librosa.display
-
         y, sr = load_audio_for_analysis(audio_path)
-        D = librosa.stft(y, n_fft=2048, hop_length=256)
-        S_db = librosa.amplitude_to_db(np.abs(D), ref=np.max)
+        freqs, times, S_db = compute_stft_db(y, sr, n_fft=2048, hop_length=256)
 
         metadata = {}
         try:
@@ -2337,18 +2325,7 @@ def repredict_standalone_audio():
             tmp_spec_path = tmp_spec.name
 
         try:
-            plt.figure(figsize=(12, 6))
-            librosa.display.specshow(S_db, sr=sr, hop_length=256, x_axis='time', y_axis='hz', cmap='viridis')
-            plt.colorbar(format='%+2.0f dB')
-            plt.ylim(10000, 200000)
-            plt.yticks(np.arange(10000, 200001, 20000))
-            plt.title(file_name, color='white', fontsize=14)
-            plt.xlabel('Time (s)', color='white')
-            plt.ylabel('Frequency (Hz)', color='white')
-            plt.tick_params(colors='white')
-            plt.tight_layout()
-            plt.savefig(tmp_spec_path, dpi=150, bbox_inches='tight', facecolor='black')
-            plt.close()
+            save_spectrogram_png(S_db, freqs, times, tmp_spec_path, file_name)
         except Exception as e:
             logger.error(f"Failed to generate spectrogram: {e}")
 
