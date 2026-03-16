@@ -97,15 +97,73 @@ def load_audio_for_analysis(audio_path):
     """Load WAV audio without depending on librosa.load/pkg_resources."""
     import soundfile as sf
 
+    y, sr = sf.read(str(audio_path), always_2d=False)
+    if isinstance(y, np.ndarray) and y.ndim > 1:
+        y = np.mean(y, axis=1)
+    return y.astype(np.float32, copy=False), sr
+
+
+def get_basic_call_parameters(audio_path: Path) -> dict:
+    """Fallback call-parameter estimation when advanced extractor fails."""
     try:
-        y, sr = sf.read(str(audio_path), always_2d=False)
-        if isinstance(y, np.ndarray) and y.ndim > 1:
-            y = np.mean(y, axis=1)
-        return y.astype(np.float32, copy=False), sr
-    except Exception as sf_err:
-        logger.warning(f"soundfile load failed, falling back to librosa.load: {sf_err}")
-        import librosa
-        return librosa.load(audio_path, sr=None)
+        y, sr = load_audio_for_analysis(audio_path)
+        if y.size == 0:
+            return {}
+
+        # Keep only likely bat range and compute a simple spectrogram.
+        from scipy import signal
+        freqs, times, stft_matrix = signal.stft(y, fs=sr, nperseg=2048, noverlap=1792)
+        mag = np.abs(stft_matrix)
+        if mag.size == 0:
+            return {}
+
+        band_mask = (freqs >= 10000) & (freqs <= min(200000, sr / 2))
+        if not np.any(band_mask):
+            band_mask = np.ones_like(freqs, dtype=bool)
+
+        bfreqs = freqs[band_mask]
+        bmag = mag[band_mask, :]
+        energy_t = np.mean(bmag, axis=0)
+        if energy_t.size == 0 or np.max(energy_t) <= 0:
+            return {}
+
+        threshold = np.max(energy_t) * 0.2
+        active_idx = np.where(energy_t > threshold)[0]
+        if active_idx.size == 0:
+            active_idx = np.arange(energy_t.size)
+
+        start_i, end_i = int(active_idx[0]), int(active_idx[-1])
+        peak_freq_track = bfreqs[np.argmax(bmag, axis=0)]
+
+        start_f = float(peak_freq_track[start_i]) / 1000.0
+        end_f = float(peak_freq_track[end_i]) / 1000.0
+        min_f = float(np.min(peak_freq_track[active_idx])) / 1000.0
+        max_f = float(np.max(peak_freq_track[active_idx])) / 1000.0
+        peak_f = float(np.median(peak_freq_track[active_idx])) / 1000.0
+
+        call_length_ms = float(max(0.0, times[end_i] - times[start_i]) * 1000.0)
+        fm_rate = abs(end_f - start_f) / call_length_ms if call_length_ms > 0 else 0.0
+
+        return {
+            "start_frequency": round(start_f, 2),
+            "end_frequency": round(end_f, 2),
+            "minimum_frequency": round(min_f, 2),
+            "maximum_frequency": round(max_f, 2),
+            "peak_frequency": round(peak_f, 2),
+            "bandwidth": round(max_f - min_f, 2),
+            "call_length": round(call_length_ms, 2),
+            "call_distance": 0.0,
+            "pulse_count": 1,
+            "intensity": round(float(np.mean(20 * np.log10(np.maximum(bmag[:, active_idx], 1e-10)))), 2),
+            "sonotype": "unknown",
+            "frequency_modulation_rate": round(fm_rate, 3),
+            "characteristic_frequency": round(peak_f, 2),
+            "knee_frequency": None,
+            "slope": round(end_f - start_f, 3),
+        }
+    except Exception as e:
+        logger.warning(f"Fallback call-parameter extraction failed: {e}")
+        return {}
 
 @app.route('/api/stream/audio/<file_id>')
 def stream_audio(file_id):
@@ -1909,6 +1967,7 @@ def predict_standalone_single_audio():
                     call_parameters = extract_call_parameters(Path(audio_path))
                 except Exception as e:
                     logger.error(f"Parameter extraction failed: {e}")
+                    call_parameters = get_basic_call_parameters(Path(audio_path))
 
             os.unlink(audio_path)
 
@@ -1982,6 +2041,7 @@ def predict_standalone_single_audio():
                 call_parameters = extract_call_parameters(Path(audio_path))
             except Exception as e:
                 logger.error(f"Parameter extraction failed: {e}")
+                call_parameters = get_basic_call_parameters(Path(audio_path))
 
         # Get or generate spectrogram — reuse existing if available, generate only when missing
         tmp_spec_path = None
@@ -2271,6 +2331,7 @@ def repredict_standalone_audio():
                 call_parameters = extract_call_parameters(Path(audio_path))
             except Exception as e:
                 logger.error(f"Parameter extraction failed: {e}")
+                call_parameters = get_basic_call_parameters(Path(audio_path))
 
         with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_spec:
             tmp_spec_path = tmp_spec.name
