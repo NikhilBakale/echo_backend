@@ -3,7 +3,6 @@ import cv2
 from scipy import ndimage, signal
 from scipy.interpolate import interp1d
 from typing import Dict, List, Tuple, Optional
-import librosa
 import soundfile as sf
 from pathlib import Path
 from dataclasses import dataclass
@@ -52,24 +51,26 @@ class SpectrogramParameterExtractor:
     
     def extract_parameters(self, audio_path: Path) -> EnhancedCallParameters:
         """Main extraction pipeline"""
-        # Load WAV with soundfile first to avoid optional audioread/pkg_resources path.
-        try:
-            y, sr = sf.read(str(audio_path), always_2d=False)
-            if isinstance(y, np.ndarray) and y.ndim > 1:
-                y = np.mean(y, axis=1)
-            y = y.astype(np.float32, copy=False)
-        except Exception:
-            # Fallback keeps backward compatibility for edge file formats.
-            y, sr = librosa.load(audio_path, sr=None)
+        # Load WAV with soundfile to avoid librosa/pkg_resources dependency chain.
+        y, sr = sf.read(str(audio_path), always_2d=False)
+        if isinstance(y, np.ndarray) and y.ndim > 1:
+            y = np.mean(y, axis=1)
+        y = y.astype(np.float32, copy=False)
         
         # Generate high-resolution spectrogram
         n_fft = 2048
         hop_length = 256  # Higher temporal resolution
-        D = librosa.stft(y, n_fft=n_fft, hop_length=hop_length)
-        S_db = librosa.amplitude_to_db(np.abs(D), ref=np.max)
+        freqs_hz, times, D = signal.stft(
+            y,
+            fs=sr,
+            nperseg=n_fft,
+            noverlap=max(0, n_fft - hop_length),
+            boundary=None,
+            padded=False,
+        )
+        S_db = 20 * np.log10(np.maximum(np.abs(D), 1e-10))
         
-        freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft) / 1000.0  # Convert to kHz
-        times = librosa.frames_to_time(np.arange(S_db.shape[1]), sr=sr, hop_length=hop_length)
+        freqs = freqs_hz / 1000.0  # Convert to kHz
         
         # Apply bandpass filter (bat call range)
         freq_mask = (freqs >= 10) & (freqs <= 250)

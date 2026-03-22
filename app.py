@@ -8,6 +8,7 @@ import io
 import json
 import zipfile
 import tempfile
+import shutil
 from datetime import datetime
 import logging
 import sys
@@ -31,17 +32,18 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'models'))
 
 # Import ML model prediction function
 ML_MODEL_AVAILABLE = False
-classify_image = None
+V5_PREDICTOR_AVAILABLE = False
+v5_predictor = None
 PARAM_EXTRACTOR_AVAILABLE = False
 extract_call_parameters = None
 
 try:
-    import predict
-    classify_image = predict.classify_image
+    import batscan_v5_predict as v5_predictor
+    V5_PREDICTOR_AVAILABLE = True
     ML_MODEL_AVAILABLE = True
-    print("✅ ML model (predict.py) loaded successfully")
+    print("✅ ML model (batscan_v5_predict.py) loaded successfully")
 except Exception as e:
-    print(f"⚠️ ML model import error: {type(e).__name__}: {e}")
+    print(f"⚠️ V5 model import error: {type(e).__name__}: {e}")
     import traceback
     traceback.print_exc()
 
@@ -60,7 +62,11 @@ CORS(
     app,
     resources={
         r"/api/*": {
-            "origins": ["https://echo-frontend-tau.vercel.app"]
+            "origins": [
+                "https://echo-frontend-tau.vercel.app",
+                "http://localhost:5173",
+                "http://127.0.0.1:5173",
+            ]
         }
     },
     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
@@ -91,6 +97,27 @@ def format_bytes(size_bytes):
     p = math.pow(1024, i)
     s = round(size_bytes / p, 2)
     return f"{s} {size_names[i]}"
+
+
+SPECTROGRAM_IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg')
+MODEL_PREDICTION_THRESHOLD = 0.21
+MODEL_DENOISE_MODE = 'full'
+
+
+def is_spectrogram_image(file_name: str) -> bool:
+    """Return True for spectrogram files with supported image extensions."""
+    normalized = file_name.lower()
+    has_stem = 'spectrogram' in normalized or 'spectogram' in normalized
+    return has_stem and normalized.endswith(SPECTROGRAM_IMAGE_EXTENSIONS)
+
+
+def preferred_image_suffix(file_name: str, default: str = '.png') -> str:
+    """Preserve incoming image suffix for temp files when possible."""
+    lower = file_name.lower()
+    for ext in SPECTROGRAM_IMAGE_EXTENSIONS:
+        if lower.endswith(ext):
+            return ext
+    return default
 
 
 def load_audio_for_analysis(audio_path):
@@ -215,6 +242,68 @@ def save_spectrogram_png(
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='black')
     plt.close()
+
+
+def generate_model_spectrogram_for_prediction(audio_path: str, output_path: str) -> bool:
+    """Generate raw model spectrogram matching the reference predictor pipeline."""
+    try:
+        import librosa
+
+        y, sr = librosa.load(audio_path, sr=None)
+        if not np.any(y):
+            raise ValueError("Empty audio")
+
+        n_fft, hop_length = 2048, 512
+        d = librosa.stft(y, n_fft=n_fft, hop_length=hop_length)
+        s_db = librosa.amplitude_to_db(np.abs(d), ref=np.max)
+        freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft) / 1000.0
+
+        freq_mask = (freqs >= 10) & (freqs <= 250)
+        if np.any(freq_mask):
+            s_db = s_db[freq_mask, :]
+
+        from matplotlib.ticker import NullLocator
+
+        fig, ax = plt.subplots(figsize=(10, 8), facecolor='black')
+        ax.set_facecolor('black')
+        ax.imshow(s_db, aspect='auto', origin='lower', cmap='viridis')
+        ax.set_axis_off()
+        plt.subplots_adjust(left=0, right=1, bottom=0, top=1)
+        plt.margins(0, 0)
+        ax.xaxis.set_major_locator(NullLocator())
+        ax.yaxis.set_major_locator(NullLocator())
+        plt.savefig(output_path, bbox_inches='tight', pad_inches=0, dpi=150, facecolor='black')
+        plt.close(fig)
+        return True
+    except Exception as e:
+        logger.error(f"Model spectrogram generation failed: {e}")
+        return False
+
+
+def generate_display_spectrogram_for_ui(audio_path: str, output_path: str) -> bool:
+    """Generate full audio spectrogram with proper time/frequency axes for frontend display."""
+    try:
+        y, sr = load_audio_for_analysis(audio_path)
+        if y.size == 0:
+            raise ValueError("Empty audio")
+
+        freqs, times, s_db = compute_stft_db(y, sr, n_fft=2048, hop_length=256)
+        freq_mask = (freqs >= 10000) & (freqs <= min(200000, sr / 2))
+        if np.any(freq_mask):
+            freqs = freqs[freq_mask]
+            s_db = s_db[freq_mask, :]
+
+        save_spectrogram_png(
+            s_db,
+            freqs,
+            times,
+            output_path,
+            title='Bat Call Spectrogram (Frequency vs Time)',
+        )
+        return True
+    except Exception as e:
+        logger.error(f"UI spectrogram generation failed: {e}")
+        return False
 
 @app.route('/api/stream/audio/<file_id>')
 def stream_audio(file_id):
@@ -761,7 +850,7 @@ def get_bat_files(bat_id):
         for file in files:
             file_name_lower = file['name'].lower()
             # Handle both "spectrogram" and "spectogram" (with missing 'r')
-            if ('spectrogram' in file_name_lower or 'spectogram' in file_name_lower) and file_name_lower.endswith('.jpg'):
+            if is_spectrogram_image(file['name']):
                 organized_files['spectrogram'] = file
             elif 'camera' in file_name_lower and file_name_lower.endswith('.jpg'):
                 organized_files['camera'] = file
@@ -965,7 +1054,7 @@ def predict_species(bat_id):
                 wav_file = None
                 for file in files_in_folder:
                     file_name_lower = file['name'].lower()
-                    if ('spectrogram' in file_name_lower or 'spectogram' in file_name_lower) and file_name_lower.endswith('.jpg'):
+                    if is_spectrogram_image(file['name']):
                         spectrogram_file = file
                     elif file_name_lower.endswith('.wav'):
                         wav_file = file
@@ -973,7 +1062,10 @@ def predict_species(bat_id):
                 if spectrogram_file:
                     # Download spectrogram
                     gfile = drive_service.drive.CreateFile({'id': spectrogram_file['id']})
-                    with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
+                    with tempfile.NamedTemporaryFile(
+                        suffix=preferred_image_suffix(spectrogram_file['name']),
+                        delete=False,
+                    ) as tmp:
                         gfile.GetContentFile(tmp.name)
                         spectrogram_path = tmp.name
                         logger.info(f"Downloaded spectrogram to {spectrogram_path}")
@@ -1006,7 +1098,11 @@ def predict_species(bat_id):
                 }), 400
             
             file = request.files['file']
-            with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
+            upload_name = file.filename or ''
+            with tempfile.NamedTemporaryFile(
+                suffix=preferred_image_suffix(upload_name),
+                delete=False,
+            ) as tmp:
                 file.save(tmp.name)
                 spectrogram_path = tmp.name
                 logger.info(f"Saved uploaded file to {spectrogram_path}")
@@ -1038,9 +1134,9 @@ def predict_species(bat_id):
             
             logger.info(f"Running ML model prediction on {spectrogram_path}")
             
-            # Get multi-species predictions with 20% threshold
+            # Keep backend response format, but use unified reference-style threshold.
             from models.predict import classify_image_multi
-            all_species = classify_image_multi(spectrogram_path, threshold=0.20)
+            all_species = classify_image_multi(spectrogram_path, threshold=MODEL_PREDICTION_THRESHOLD)
             
             # Get top species for backward compatibility
             # classify_image_multi returns list of (species_name, confidence_pct) tuples
@@ -1051,7 +1147,7 @@ def predict_species(bat_id):
                 predicted_species = "Unknown_species"
                 confidence = 0.0
             
-            logger.info(f"ML Prediction: {len(all_species)} species detected above 50% threshold")
+            logger.info(f"ML Prediction: {len(all_species)} species detected above {MODEL_PREDICTION_THRESHOLD * 100:.1f}% threshold")
             logger.info(f"Top species: {predicted_species} ({confidence}%)")
             
             # Extract call parameters if available
@@ -1281,12 +1377,13 @@ def predict_single_audio():
     Returns: Multi-species predictions with confidence
     """
     data = None
+    audio_path = None
+    tmp_predict_dir = None
+    tmp_preview_path = None
     try:
         data = request.get_json()
         file_id = data.get('file_id')
         file_name = data.get('file_name')
-        server_num = data.get('server_num', '1')
-        client_num = data.get('client_num', '1')
         skip_prediction = data.get('skip_prediction', False)
 
         if not file_id:
@@ -1301,12 +1398,11 @@ def predict_single_audio():
         spec_filename = Path(file_name).stem + '.png'
         audio_url = f"{base_url}/api/stream/audio/{file_id}"
 
-        # Get parent folder and check if spectrogram already exists in Drive
+        # Get parent folder and check if preview spectrogram already exists in Drive
         folder_id = drive_service.get_parent_folder_id(file_id)
         existing_spec = drive_service.find_file_in_folder(folder_id, spec_filename) if folder_id else None
 
         if existing_spec and skip_prediction:
-            # Spectrogram cached in Drive, skip ML — only download wav for metadata/params
             logger.info(f"Using cached spectrogram for {file_name}")
             spectrogram_url = f"{base_url}/api/stream/spectrogram/{existing_spec['id']}"
 
@@ -1326,9 +1422,11 @@ def predict_single_audio():
                         call_parameters = extract_call_parameters(Path(audio_path))
                     except Exception as param_err:
                         logger.warning(f"Could not extract call parameters: {param_err}")
-                os.unlink(audio_path)
             except Exception as e:
                 logger.warning(f"Could not extract metadata/params for cached file: {e}")
+            finally:
+                if audio_path and os.path.exists(audio_path):
+                    os.unlink(audio_path)
 
             return jsonify({
                 'success': True,
@@ -1347,7 +1445,12 @@ def predict_single_audio():
                 'from_cache': True
             })
 
-        # --- Full processing path ---
+        if not V5_PREDICTOR_AVAILABLE:
+            return jsonify({
+                'success': False,
+                'message': 'V5 prediction module is not available'
+            }), 500
+
         # Download audio to temp
         with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
             drive_service.drive.CreateFile({'id': file_id}).GetContentFile(tmp.name)
@@ -1371,56 +1474,37 @@ def predict_single_audio():
             except Exception as param_err:
                 logger.warning(f"Could not extract call parameters: {param_err}")
 
-        # Get or generate spectrogram — reuse existing if available, generate only when missing
-        tmp_spec_path = None
-        spec_drive_id = None
-        if existing_spec:
-            # Spec already in Drive — download for ML, skip regeneration and re-upload
-            logger.info(f"Spec already in Drive for {file_name}, reusing existing (no regeneration)")
-            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_s:
-                tmp_spec_path = tmp_s.name
+        tmp_predict_dir = tempfile.mkdtemp(prefix='batscan_v5_')
+
+        # For frontend display: one full spectrogram image with proper frequency/time axes.
+        tmp_preview_path = os.path.join(tmp_predict_dir, 'preview_spectrogram.png')
+        preview_ok = generate_display_spectrogram_for_ui(audio_path, tmp_preview_path)
+
+        spec_drive_id = existing_spec['id'] if existing_spec else None
+        if preview_ok and folder_id and spec_drive_id is None:
             try:
-                drive_service.drive.CreateFile({'id': existing_spec['id']}).GetContentFile(tmp_spec_path)
-                spec_drive_id = existing_spec['id']
-            except Exception as dl_err:
-                logger.warning(f"Could not download existing spec, will regenerate: {dl_err}")
-                tmp_spec_path = None
-                spec_drive_id = None
+                spec_drive_id = drive_service.upload_file_to_folder(
+                    folder_id,
+                    tmp_preview_path,
+                    spec_filename,
+                    'image/png'
+                )
+            except Exception as upload_err:
+                logger.error(f"Could not upload spectrogram to Drive: {upload_err}")
 
-        if not existing_spec or spec_drive_id is None:
-            # Generate spectrogram from WAV and upload to Drive
-            freqs, times, S_db = compute_stft_db(y, sr, n_fft=2048, hop_length=256)
-
-            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_spec:
-                tmp_spec_path = tmp_spec.name
-
-            save_spectrogram_png(S_db, freqs, times, tmp_spec_path, file_name)
-
-            if folder_id:
-                try:
-                    spec_drive_id = drive_service.upload_file_to_folder(
-                        folder_id, tmp_spec_path, spec_filename, 'image/png'
-                    )
-                except Exception as upload_err:
-                    logger.error(f"Could not upload spectrogram to Drive: {upload_err}")
-
-        # Run ML prediction on spectrogram
         species_list = []
-        if not skip_prediction and ML_MODEL_AVAILABLE and tmp_spec_path:
-            from models.predict import classify_image_multi
-            all_species = classify_image_multi(tmp_spec_path, threshold=0.20)
-            species_list = [{'species': sp[0], 'confidence': round(sp[1], 1)} for sp in all_species]
-
-        # Delete temp files
-        if tmp_spec_path:
-            try:
-                os.unlink(tmp_spec_path)
-            except Exception:
-                pass
-        try:
-            os.unlink(audio_path)
-        except Exception:
-            pass
+        chunk_result = None
+        if not skip_prediction:
+            chunk_result = v5_predictor.predict_audio_file(
+                audio_path,
+                threshold=MODEL_PREDICTION_THRESHOLD,
+                denoise_mode=MODEL_DENOISE_MODE,
+                apply_cv_filter=False,
+                tmp_dir=tmp_predict_dir,
+            )
+            if chunk_result.get('error'):
+                raise RuntimeError(chunk_result['error'])
+            species_list = v5_predictor.weighted_scores_to_species_list(chunk_result.get('weighted_scores', []))
 
         spectrogram_url = f"{base_url}/api/stream/spectrogram/{spec_drive_id}" if spec_drive_id else None
 
@@ -1437,7 +1521,11 @@ def predict_single_audio():
             'duration': round(len(y) / sr, 2),
             'sample_rate': sr,
             'spectrogram_url': spectrogram_url,
-            'audio_url': audio_url
+            'audio_url': audio_url,
+            'denoise_mode': MODEL_DENOISE_MODE,
+            'chunk_count': chunk_result.get('n_chunks_total', 0) if chunk_result else 0,
+            'chunk_valid_count': chunk_result.get('n_chunks_valid', 0) if chunk_result else 0,
+            'chunk_rejected_count': chunk_result.get('n_cv_rejected', 0) if chunk_result else 0,
         }
 
         logger.info(f"Processed {file_name}: {len(species_list)} species detected")
@@ -1451,6 +1539,17 @@ def predict_single_audio():
             'file_id': data.get('file_id') if data else None,
             'file_name': data.get('file_name') if data else None
         }), 500
+    finally:
+        if audio_path and os.path.exists(audio_path):
+            try:
+                os.unlink(audio_path)
+            except Exception:
+                pass
+        if tmp_predict_dir and os.path.exists(tmp_predict_dir):
+            try:
+                shutil.rmtree(tmp_predict_dir, ignore_errors=True)
+            except Exception:
+                pass
 
 
 @app.route('/api/batch/folder', methods=['POST'])
@@ -1512,24 +1611,28 @@ def batch_process_folder():
                 from guano_metadata_extractor import extract_metadata_from_file
                 metadata = extract_metadata_from_file(audio_path)
                 
-                # Generate spectrogram
                 y, sr = load_audio_for_analysis(audio_path)
-                freqs, times, S_db = compute_stft_db(y, sr, n_fft=2048, hop_length=256)
-                
-                # Save spectrogram
-                with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_spec:
-                    spectrogram_path = tmp_spec.name
-                save_spectrogram_png(S_db, freqs, times, spectrogram_path, audio_file['name'])
-                
-                # Run ML prediction
-                if ML_MODEL_AVAILABLE:
-                    from models.predict import classify_image_multi
-                    all_species = classify_image_multi(spectrogram_path, threshold=0.01)
-                    
-                    # Format species data for frontend (list of {species, confidence})
-                    species_list = [{'species': sp[0], 'confidence': round(sp[1] * 100, 1)} for sp in all_species]
-                else:
-                    species_list = []
+
+                if not V5_PREDICTOR_AVAILABLE:
+                    raise RuntimeError("V5 prediction module is not available")
+
+                tmp_predict_dir = tempfile.mkdtemp(prefix='batscan_v5_batch_')
+                try:
+                    chunk_result = v5_predictor.predict_audio_file(
+                        audio_path,
+                        threshold=MODEL_PREDICTION_THRESHOLD,
+                        denoise_mode=MODEL_DENOISE_MODE,
+                        apply_cv_filter=False,
+                        tmp_dir=tmp_predict_dir,
+                    )
+                    if chunk_result.get('error'):
+                        raise RuntimeError(chunk_result['error'])
+
+                    species_list = v5_predictor.weighted_scores_to_species_list(
+                        chunk_result.get('weighted_scores', [])
+                    )
+                finally:
+                    shutil.rmtree(tmp_predict_dir, ignore_errors=True)
                 
                 # Extract call parameters
                 call_parameters = {}
@@ -1550,7 +1653,11 @@ def batch_process_folder():
                     'call_parameters': call_parameters,
                     'metadata': metadata,
                     'duration': round(len(y) / sr, 2) if 'y' in locals() else 0,
-                    'sample_rate': sr if 'sr' in locals() else 0
+                    'sample_rate': sr if 'sr' in locals() else 0,
+                    'denoise_mode': MODEL_DENOISE_MODE,
+                    'chunk_count': chunk_result.get('n_chunks_total', 0),
+                    'chunk_valid_count': chunk_result.get('n_chunks_valid', 0),
+                    'chunk_rejected_count': chunk_result.get('n_cv_rejected', 0)
                 }
                 
                 results.append(result)
@@ -1558,9 +1665,6 @@ def batch_process_folder():
                 # Clean up temp files
                 if os.path.exists(audio_path):
                     os.remove(audio_path)
-                if os.path.exists(spectrogram_path):
-                    os.remove(spectrogram_path)
-                
                 logger.info(f"Processed {audio_file['name']}: {result['predicted_species']} ({result['confidence']}%)")
                 
             except Exception as file_err:
@@ -2001,7 +2105,7 @@ def predict_standalone_single_audio():
                 try:
                     drive_service.drive.CreateFile({'id': existing_spec['id']}).GetContentFile(tmp_spec_path)
                     from models.predict import classify_image_multi
-                    all_species = classify_image_multi(tmp_spec_path, threshold=0.20)
+                    all_species = classify_image_multi(tmp_spec_path, threshold=MODEL_PREDICTION_THRESHOLD)
                     species_predictions = [{'species': sp[0], 'confidence': round(sp[1], 1)} for sp in all_species]
                 except Exception as e:
                     logger.error(f"ML prediction failed: {e}")
@@ -2062,60 +2166,50 @@ def predict_standalone_single_audio():
                 logger.error(f"Parameter extraction failed: {e}")
                 call_parameters = get_basic_call_parameters(Path(audio_path))
 
-        # Get or generate spectrogram — reuse existing if available, generate only when missing
-        tmp_spec_path = None
-        spec_drive_id = None
-        if existing_spec:
-            # Spec already in Drive — download for ML, skip regeneration and re-upload
-            logger.info(f"Spec already in Drive for {file_name}, reusing existing (no regeneration)")
-            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_s:
-                tmp_spec_path = tmp_s.name
+        # Generate and upload a single full spectrogram for frontend display.
+        tmp_predict_dir = tempfile.mkdtemp(prefix='batscan_v5_standalone_')
+        tmp_spec_path = os.path.join(tmp_predict_dir, 'preview_spectrogram.png')
+        spec_drive_id = existing_spec['id'] if existing_spec else None
+        try:
+            if not generate_display_spectrogram_for_ui(audio_path, tmp_spec_path):
+                raise RuntimeError("Failed to generate UI spectrogram")
+            logger.info(f"Generated UI spectrogram: {tmp_spec_path}")
+        except Exception as e:
+            logger.error(f"Failed to generate UI spectrogram: {e}")
+
+        # Upload only if a Drive spectrogram does not already exist.
+        if folder_id and spec_drive_id is None:
             try:
-                drive_service.drive.CreateFile({'id': existing_spec['id']}).GetContentFile(tmp_spec_path)
-                spec_drive_id = existing_spec['id']
-            except Exception as dl_err:
-                logger.warning(f"Could not download existing spec, will regenerate: {dl_err}")
-                tmp_spec_path = None
-                spec_drive_id = None
+                spec_drive_id = drive_service.upload_file_to_folder(
+                    folder_id, tmp_spec_path, spec_filename, 'image/png'
+                )
+            except Exception as upload_err:
+                logger.error(f"Could not upload spectrogram to Drive: {upload_err}")
 
-        if not existing_spec or spec_drive_id is None:
-            # Generate spectrogram from WAV and upload to Drive
-            freqs, times, S_db = compute_stft_db(y, sr, n_fft=2048, hop_length=256)
-
-            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_spec:
-                tmp_spec_path = tmp_spec.name
-
-            try:
-                save_spectrogram_png(S_db, freqs, times, tmp_spec_path, file_name)
-                logger.info(f"Generated spectrogram: {tmp_spec_path}")
-            except Exception as e:
-                logger.error(f"Failed to generate spectrogram: {e}")
-
-            if folder_id:
-                try:
-                    spec_drive_id = drive_service.upload_file_to_folder(
-                        folder_id, tmp_spec_path, spec_filename, 'image/png'
-                    )
-                except Exception as upload_err:
-                    logger.error(f"Could not upload spectrogram to Drive: {upload_err}")
-
-        # Run ML prediction
+        # Run new chunked predictor (denoised full, no CV 7-gate).
         species_predictions = []
-        if ML_MODEL_AVAILABLE and tmp_spec_path:
+        chunk_result = None
+        if not skip_prediction:
             try:
-                from models.predict import classify_image_multi
-                all_species = classify_image_multi(tmp_spec_path, threshold=0.20)
-                species_predictions = [{'species': sp[0], 'confidence': round(sp[1], 1)} for sp in all_species]
-                logger.info(f"ML predictions: {len(species_predictions)} species detected")
+                chunk_result = v5_predictor.predict_audio_file(
+                    audio_path,
+                    threshold=MODEL_PREDICTION_THRESHOLD,
+                    denoise_mode=MODEL_DENOISE_MODE,
+                    apply_cv_filter=False,
+                    tmp_dir=tmp_predict_dir,
+                )
+                if chunk_result.get('error'):
+                    raise RuntimeError(chunk_result['error'])
+                species_predictions = v5_predictor.weighted_scores_to_species_list(
+                    chunk_result.get('weighted_scores', [])
+                )
+                logger.info(f"V5 predictions: {len(species_predictions)} species detected")
             except Exception as e:
-                logger.error(f"ML prediction failed: {e}")
+                logger.error(f"V5 prediction failed: {e}")
 
         # Delete temp files
-        if tmp_spec_path:
-            try:
-                os.unlink(tmp_spec_path)
-            except Exception:
-                pass
+        if tmp_predict_dir and os.path.exists(tmp_predict_dir):
+            shutil.rmtree(tmp_predict_dir, ignore_errors=True)
         try:
             os.unlink(audio_path)
         except Exception:
@@ -2137,6 +2231,10 @@ def predict_standalone_single_audio():
             'sample_rate': sample_rate,
             'spectrogram_url': spectrogram_url,
             'audio_url': audio_url,
+            'denoise_mode': MODEL_DENOISE_MODE,
+            'chunk_count': chunk_result.get('n_chunks_total', 0) if chunk_result else 0,
+            'chunk_valid_count': chunk_result.get('n_chunks_valid', 0) if chunk_result else 0,
+            'chunk_rejected_count': chunk_result.get('n_cv_rejected', 0) if chunk_result else 0,
             'from_cache': False
         })
 
@@ -2184,7 +2282,6 @@ def repredict_audio():
             audio_path = tmp.name
 
         y, sr = load_audio_for_analysis(audio_path)
-        freqs, times, S_db = compute_stft_db(y, sr, n_fft=2048, hop_length=256)
 
         metadata = {}
         try:
@@ -2200,16 +2297,23 @@ def repredict_audio():
             except Exception as param_err:
                 logger.warning(f"Could not extract call parameters: {param_err}")
 
-        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_spec:
-            tmp_spec_path = tmp_spec.name
+        tmp_predict_dir = tempfile.mkdtemp(prefix='batscan_v5_repredict_')
+        tmp_spec_path = os.path.join(tmp_predict_dir, 'preview_spectrogram.png')
 
-        save_spectrogram_png(S_db, freqs, times, tmp_spec_path, file_name)
+        if not generate_display_spectrogram_for_ui(audio_path, tmp_spec_path):
+            raise RuntimeError("Failed to generate UI spectrogram")
 
-        species_list = []
-        if ML_MODEL_AVAILABLE:
-            from models.predict import classify_image_multi
-            all_species = classify_image_multi(tmp_spec_path, threshold=0.20)
-            species_list = [{'species': sp[0], 'confidence': round(sp[1], 1)} for sp in all_species]
+        chunk_result = v5_predictor.predict_audio_file(
+            audio_path,
+            threshold=MODEL_PREDICTION_THRESHOLD,
+            denoise_mode=MODEL_DENOISE_MODE,
+            apply_cv_filter=False,
+            tmp_dir=tmp_predict_dir,
+        )
+        if chunk_result.get('error'):
+            raise RuntimeError(chunk_result['error'])
+
+        species_list = v5_predictor.weighted_scores_to_species_list(chunk_result.get('weighted_scores', []))
 
         spec_drive_id = None
         if folder_id:
@@ -2220,10 +2324,8 @@ def repredict_audio():
             except Exception as upload_err:
                 logger.error(f"Could not upload spectrogram to Drive: {upload_err}")
 
-        try:
-            os.unlink(tmp_spec_path)
-        except Exception:
-            pass
+        if tmp_predict_dir and os.path.exists(tmp_predict_dir):
+            shutil.rmtree(tmp_predict_dir, ignore_errors=True)
         try:
             os.unlink(audio_path)
         except Exception:
@@ -2244,7 +2346,11 @@ def repredict_audio():
             'duration': round(len(y) / sr, 2),
             'sample_rate': sr,
             'spectrogram_url': spectrogram_url,
-            'audio_url': audio_url
+            'audio_url': audio_url,
+            'denoise_mode': MODEL_DENOISE_MODE,
+            'chunk_count': chunk_result.get('n_chunks_total', 0),
+            'chunk_valid_count': chunk_result.get('n_chunks_valid', 0),
+            'chunk_rejected_count': chunk_result.get('n_cv_rejected', 0)
         })
 
     except Exception as e:
@@ -2304,7 +2410,6 @@ def repredict_standalone_audio():
             pass
 
         y, sr = load_audio_for_analysis(audio_path)
-        freqs, times, S_db = compute_stft_db(y, sr, n_fft=2048, hop_length=256)
 
         metadata = {}
         try:
@@ -2321,22 +2426,25 @@ def repredict_standalone_audio():
                 logger.error(f"Parameter extraction failed: {e}")
                 call_parameters = get_basic_call_parameters(Path(audio_path))
 
-        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_spec:
-            tmp_spec_path = tmp_spec.name
+        tmp_predict_dir = tempfile.mkdtemp(prefix='batscan_v5_standalone_repredict_')
+        tmp_spec_path = os.path.join(tmp_predict_dir, 'preview_spectrogram.png')
 
         try:
-            save_spectrogram_png(S_db, freqs, times, tmp_spec_path, file_name)
+            if not generate_display_spectrogram_for_ui(audio_path, tmp_spec_path):
+                raise RuntimeError("Failed to generate UI spectrogram")
         except Exception as e:
-            logger.error(f"Failed to generate spectrogram: {e}")
+            logger.error(f"Failed to generate UI spectrogram: {e}")
 
-        species_predictions = []
-        if ML_MODEL_AVAILABLE:
-            try:
-                from models.predict import classify_image_multi
-                all_species = classify_image_multi(tmp_spec_path, threshold=0.20)
-                species_predictions = [{'species': sp[0], 'confidence': round(sp[1], 1)} for sp in all_species]
-            except Exception as e:
-                logger.error(f"ML prediction failed: {e}")
+        chunk_result = v5_predictor.predict_audio_file(
+            audio_path,
+            threshold=MODEL_PREDICTION_THRESHOLD,
+            denoise_mode=MODEL_DENOISE_MODE,
+            apply_cv_filter=False,
+            tmp_dir=tmp_predict_dir,
+        )
+        if chunk_result.get('error'):
+            raise RuntimeError(chunk_result['error'])
+        species_predictions = v5_predictor.weighted_scores_to_species_list(chunk_result.get('weighted_scores', []))
 
         spec_drive_id = None
         if folder_id:
@@ -2347,10 +2455,8 @@ def repredict_standalone_audio():
             except Exception as upload_err:
                 logger.error(f"Could not upload spectrogram to Drive: {upload_err}")
 
-        try:
-            os.unlink(tmp_spec_path)
-        except Exception:
-            pass
+        if tmp_predict_dir and os.path.exists(tmp_predict_dir):
+            shutil.rmtree(tmp_predict_dir, ignore_errors=True)
         try:
             os.unlink(audio_path)
         except Exception:
@@ -2371,7 +2477,11 @@ def repredict_standalone_audio():
             'duration': duration,
             'sample_rate': sample_rate,
             'spectrogram_url': spectrogram_url,
-            'audio_url': audio_url
+            'audio_url': audio_url,
+            'denoise_mode': MODEL_DENOISE_MODE,
+            'chunk_count': chunk_result.get('n_chunks_total', 0),
+            'chunk_valid_count': chunk_result.get('n_chunks_valid', 0),
+            'chunk_rejected_count': chunk_result.get('n_cv_rejected', 0)
         })
 
     except Exception as e:
